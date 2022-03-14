@@ -7,11 +7,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pitch_detection::detector::{PitchDetector};
 use pitch_detection::detector::mcleod::{McLeodDetector};
 
-//const BUFFER_SIZE: usize = 88200; // enough to hold 2 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
+const BUFFER_SIZE: usize = 88200; // enough to hold 2 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
 //const BUFFER_SIZE: usize = 34053; // for testing
-const BUFFER_SIZE: usize = 44100; // enough to hold 1 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
-//const SAMPLES_PER_FFT: usize = 8192; // that is, 2^13 - slightly less than 1/4 of a second (at 44k sample rate, specified above), and a power of two (for FFT) - G3 is 196 cycles/second; this (2^13) works out to .186 seconds, which is about 36 peaks per frame at that lowest frequency, which should still be plenty for an FFT; obviously, as pitch goes up, so does the suitability of this small sample frame, for FFT purposes, because there will be more peaks per frame at higher frequencies.
-const SAMPLES_PER_FFT: usize = 1024; // that is, 2^10; 1024 is considered a good balance between efficiency and accuracy for audio purposes (NOTE: may need to increase this for accuracy at lower notes!)
+//const BUFFER_SIZE: usize = 44100; // enough to hold 1 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
+const SAMPLES_PER_FFT: usize = 8192; // that is, 2^13 - slightly less than 1/4 of a second (at 44k sample rate, specified above), and a power of two (for FFT) - G3 is 196 cycles/second; this (2^13) works out to .186 seconds, which is about 36 peaks per frame at that lowest frequency, which should still be plenty for an FFT; obviously, as pitch goes up, so does the suitability of this small sample frame, for FFT purposes, because there will be more peaks per frame at higher frequencies.
+//const SAMPLES_PER_FFT: usize = 4096; // that is, 2^13 - slightly less than 1/4 of a second (at 44k sample rate, specified above), and a power of two (for FFT) - G3 is 196 cycles/second; this (2^13) works out to .186 seconds, which is about 36 peaks per frame at that lowest frequency, which should still be plenty for an FFT; obviously, as pitch goes up, so does the suitability of this small sample frame, for FFT purposes, because there will be more peaks per frame at higher frequencies.
+//const SAMPLES_PER_FFT: usize = 1024; // that is, 2^10; 1024 is considered a good balance between efficiency and accuracy for audio purposes (NOTE: may need to increase this for accuracy at lower notes!)
 const ZERO_BUF: [f32; BUFFER_SIZE] = [0.0; BUFFER_SIZE]; // empty buffer, for filling an outbuf with zeros
 const POWER_THRESHOLD: f32 = 5.0; // only include audio input that is powerful enough to count as a true tone (library recommends 5.0)
 const CLARITY_THRESHOLD: f32 = 0.6; // how coherent the sound of a note is (valid values are in the range 0-1)
@@ -150,6 +151,7 @@ impl Processor {
 
 	fn process(&mut self) { // process one chunk from self.out_end to self.out_end + SAMPLES_PER_FFT
 		// do the analysis, then replace the slice of self.buffer with output data according to the analysis
+		/*
 		let in_pitch = self.detector.get_pitch(
 			&self.buffer[self.out_end .. self.out_end + SAMPLES_PER_FFT],
 			self.samples_per_second as usize,
@@ -166,11 +168,11 @@ impl Processor {
 				}
 			}
 			None => {
-				println!("NO pitch");
 				// just fill self.buffer with that many zeros (silence):
 				self.buffer[self.out_end .. self.out_end + SAMPLES_PER_FFT].copy_from_slice(&ZERO_BUF[ .. SAMPLES_PER_FFT]);
 			}
 		}
+		*/
 		
 		// move up self.out_end:
 		self.out_end = self.out_end + SAMPLES_PER_FFT;
@@ -244,7 +246,7 @@ fn main() -> Result<()> {
 	in_stream.play()?;
 
 	// TEST: just "play" for ... seconds:
-	std::thread::sleep(std::time::Duration::from_millis(4000));
+	std::thread::sleep(std::time::Duration::from_millis(8000));
 	drop(in_stream);
 	drop(out_stream);
 	//TODO: let rb = RingBuffer::<i32>::new(2);
