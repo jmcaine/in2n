@@ -1,22 +1,74 @@
 use std::cmp;
 use std::sync::{Arc, Mutex};
 
+mod freqs;
+
 use anyhow::{Result, bail}; // thus, return Result<T> rather than Result<T, anyhow::Error>  (that is, we're using anyhow::Result rather than std::Result)
 use cpal::{SampleFormat};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use pitch_detection::detector::{PitchDetector};
-use pitch_detection::detector::mcleod::{McLeodDetector};
+use rustfft::{Fft, FftNum, FftDirection, num_complex::Complex, algorithm::Radix4};
 
 const BUFFER_SIZE: usize = 88200; // enough to hold 2 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
 //const BUFFER_SIZE: usize = 34053; // for testing
 //const BUFFER_SIZE: usize = 44100; // enough to hold 1 second of buffer @44k sample-rate. (Normally, we'll process about a tenth of a second at a time, so this is more than ample.)
+//const SAMPLES_PER_FFT: usize = 16384; // that is, 2^14
 const SAMPLES_PER_FFT: usize = 8192; // that is, 2^13 - slightly less than 1/4 of a second (at 44k sample rate, specified above), and a power of two (for FFT) - G3 is 196 cycles/second; this (2^13) works out to .186 seconds, which is about 36 peaks per frame at that lowest frequency, which should still be plenty for an FFT; obviously, as pitch goes up, so does the suitability of this small sample frame, for FFT purposes, because there will be more peaks per frame at higher frequencies.
-//const SAMPLES_PER_FFT: usize = 4096; // that is, 2^13 - slightly less than 1/4 of a second (at 44k sample rate, specified above), and a power of two (for FFT) - G3 is 196 cycles/second; this (2^13) works out to .186 seconds, which is about 36 peaks per frame at that lowest frequency, which should still be plenty for an FFT; obviously, as pitch goes up, so does the suitability of this small sample frame, for FFT purposes, because there will be more peaks per frame at higher frequencies.
+//const SAMPLES_PER_FFT: usize = 4096; // that is, 2^12
 //const SAMPLES_PER_FFT: usize = 1024; // that is, 2^10; 1024 is considered a good balance between efficiency and accuracy for audio purposes (NOTE: may need to increase this for accuracy at lower notes!)
 const ZERO_BUF: [f32; BUFFER_SIZE] = [0.0; BUFFER_SIZE]; // empty buffer, for filling an outbuf with zeros
-const POWER_THRESHOLD: f32 = 5.0; // only include audio input that is powerful enough to count as a true tone (library recommends 5.0)
-const CLARITY_THRESHOLD: f32 = 0.6; // how coherent the sound of a note is (valid values are in the range 0-1)
- 
+const TRIAL_BINS: usize = 3;
+
+struct Note {
+	index: usize, // index into EVEN_TEMP_FREQS - see freqs.rs TODO: expand to use just-tempered possibilities!
+	duration: u16, // ms
+}
+impl Note {
+	fn new(index: usize, duration: u16) -> Note {
+		Note {
+			index: index,
+			duration: duration,
+		}
+	}
+}
+struct Song {
+	notes: Vec<Note>,
+	cp: usize, // current position in the song; index into  notes, indicating the "current" (target) note (note being presently played, or, perhaps, note about to be played
+	cp_secs: u16,
+	samples_per_second: f32,
+}
+
+impl Song {
+	fn new(samples_per_second: f32, notes: Vec::<Note>) -> Song {
+		Song {
+			notes: notes,
+			cp: 0,
+			cp_secs: 0,
+			samples_per_second: samples_per_second,
+		}
+	}
+	fn match_note(&mut self, index: usize, frequencies: [f32; TRIAL_BINS]) ->  f32 { // trial bins of frequencies, so we get the most powerful and, possibly, some octaves; it may be that the real root is less powerful than a octave harmonic, so this may do nothing....
+		let target = freqs::EVEN_TEMP_FREQS[index];
+		let below =  if index > 0 { freqs::EVEN_TEMP_FREQS[index - 1]  } else { target };
+		let above =  if index + 1 < freqs::EVEN_TEMP_FREQS.len() { freqs::EVEN_TEMP_FREQS[index + 1] } else { target };
+		let low_bound = below + (target - below) * 2./3.; // TODO: instead, consider note before or notes around (within our song note sequence)-- you might be able to set this low lower and catch "way too flat" input without risking being on the wrong note in the sequence
+		let high_bound = above - (above - target) * 2./3.;
+		println!("lo: {}, hi: {}, actual: {} {} {}", low_bound, high_bound, frequencies[0], frequencies[1], frequencies[2]);
+		for frequency in frequencies.iter() {
+			if low_bound <= *frequency && *frequency <= high_bound { // TODO: what if one of the frequency values is of a harmonic? Then we'd have to check against low/high-bounds of the harmonics!?
+				self.cp_secs += (SAMPLES_PER_FFT as f32 / self.samples_per_second) as u16;
+				return target;
+			}
+		}
+		// else...
+		self.cp_secs = 0;
+		return 0f32; // "silence" indicator
+	}
+	fn match_current_note(&mut self, frequencies: [f32; TRIAL_BINS]) -> f32 {
+		return self.match_note(self.notes[self.cp].index, frequencies);
+	}
+}
+
+
 struct WaveMaker {
 	samples_per_second: f32,
 	sample_clock: f32,
@@ -41,27 +93,41 @@ impl WaveMaker {
 	}
 }
 
+struct Evaluator {
+	hit_rate: f32, // ratio: number of "hits" (frames which we've evaluated to a "match" between incoming frequency and expected frequency at song's cp) to total number of frames attempted, to make such a match, since the matching started; note that silent fames are not counted
+	cp_frames: u16, // the number of frames attempted (during the processing of the current note) (not including silent frames
+	silent_frames: u16, // the number of frames (during the processing of the current note) that appear to be "silent"
+	pitch_precision: f32, // deviation of input frequency from expected frequency
+
+}
+
 struct Processor {
+	song: Song,
+	bogus: [Complex<f32>; SAMPLES_PER_FFT],
 	buffer: [f32; BUFFER_SIZE], // shared buffer; input data is placed in it; FFT is performed in-place on data, and then new output data is written into the same space; indeces march along to keep ranges separate
 	in_end: usize,  // upper (non-inclusive) index of current (most recent) input; next available input would start at this index; stays ahead of out_end (or, in the extreme case, out_end can become equal to in_end)
 	out_start: usize, out_end: usize, // starting index and upper (non-inclusive) index of "available for output" data - data that can be copied to output buffer
 		// note that out_end is effectively "in_start", except when processing flips back to the start of the buffer, in which case the in_start will be index 0
 	samples_per_second: f32,
-	detector: McLeodDetector::<f32>,
+	fft: Radix4<f32>,
 	wave_maker: WaveMaker,
 }
 
 impl Processor {
+	/*
 	fn new(samples_per_second: f32) -> Processor { // though we don't use this, since we want this on the stack
 		Processor {
+			song: Song::demo_c_scale(),
+			bogus: [Complex::new(0f32, 0f32); SAMPLES_PER_FFT],
 			buffer: [0.0; BUFFER_SIZE],
 			in_end: 0,
 			out_start: 0, out_end: 0,
 			samples_per_second: samples_per_second,
-			detector: McLeodDetector::<f32>::new(SAMPLES_PER_FFT, SAMPLES_PER_FFT/2),
+			fft: Radix4::new(SAMPLES_PER_FFT, FftDirection::Forward),
 			wave_maker: WaveMaker::new(samples_per_second),
 		}
 	}
+	*/
 
 	pub fn add(&mut self, data: &[f32]) { // add data to our internal buffer AND (possibly) process some of it (if there's enough)
 		// strategy: lay data in in one fell swoop, or "split" if at end of buffer; then loop-process SAMPLES_PER_FFT samples at a time, unless out_start and out_end are stuck at the end of the buffer; then let consume() do the FFT and move out_start and out_end  only after
@@ -76,15 +142,15 @@ impl Processor {
 		} else { // out_end <= in_end; there are data in our buffer that are not yet FFT'd; "<" when the last add() left less than one full FFT-worth (SAMPLES_PER_FFT) of data (this is the most common case), "==" whenever FFT has already been performed on all samples laid in
 			if self.out_end < self.in_end { assert!(blocks_room > 0); } // we should not have started laying down samples last iteration if there wasn't room for a whole FFT
 			let xfer_samples = cmp::min(data.len(), SAMPLES_PER_FFT * blocks_room - (self.in_end - self.out_end));
-			if xfer_samples > 0 {
-				self.xfer_in(data, 0, xfer_samples);
-			}
-			if xfer_samples < data.len() { // we got to the end of our buffer, but still have some `data` to absorb; so, wrap...
-				let remaining_data = data.len() - xfer_samples;
+			self.xfer_in(data, 0, xfer_samples);
+			if BUFFER_SIZE - self.in_end < SAMPLES_PER_FFT { // there is less space remaining in the buffer than we need to do one more FFT, so we have to wrap...
 				self.in_end = 0; // re-start
-				let xfer_remainder = cmp::min(remaining_data, self.out_start - self.in_end); // lay down as much of `data` as we can, but don't encroach into out_start territory
-				self.xfer_in(data, xfer_samples, xfer_remainder);
-				if xfer_remainder < remaining_data { overrun(remaining_data - xfer_remainder); }
+				let remaining_data = data.len() - xfer_samples;
+				if remaining_data > 0 { // we still have some `data` to absorb; so, now that we've reset in_end, lay the data down at the beginning:
+					let xfer_remainder = cmp::min(remaining_data, self.out_start); // lay down as much of `data` as we can, but don't encroach into out_start territory (technically, out_start-in_end, but in_end was just set to 0, so...)
+					self.xfer_in(data, xfer_samples, xfer_remainder);
+					if xfer_remainder < remaining_data { overrun(remaining_data - xfer_remainder); }
+				}
 			}
 		}
 
@@ -139,41 +205,55 @@ impl Processor {
 
 	fn xfer_out(&mut self, buffer: &mut[f32], start: usize, count: usize) {
 		//println!("xfer FROM buffer[{}:{}] (buffer.len = {})", start, start + count, buffer.len());
-		buffer[start .. start + count].copy_from_slice(&self.buffer[self.out_start .. self.out_start + count]);
-		self.out_start += count;
+		if count > 0 {
+			buffer[start .. start + count].copy_from_slice(&self.buffer[self.out_start .. self.out_start + count]);
+			self.out_start += count;
+		} // else nop
 	}
 
 	fn xfer_in(&mut self, buffer: &[f32], start: usize, count: usize) {
 		//println!("xfer TO buffer[{}:{}] (buffer.len = {})", start, start + count, buffer.len());
-		self.buffer[self.in_end .. self.in_end + count].copy_from_slice(&buffer[start .. start + count]);
-		self.in_end += count;
+		if count > 0 {
+			self.buffer[self.in_end .. self.in_end + count].copy_from_slice(&buffer[start .. start + count]);
+			self.in_end += count;
+		} // else nop
 	}
 
 	fn process(&mut self) { // process one chunk from self.out_end to self.out_end + SAMPLES_PER_FFT
 		// do the analysis, then replace the slice of self.buffer with output data according to the analysis
-		/*
-		let in_pitch = self.detector.get_pitch(
-			&self.buffer[self.out_end .. self.out_end + SAMPLES_PER_FFT],
-			self.samples_per_second as usize,
-			POWER_THRESHOLD,
-			CLARITY_THRESHOLD,
-			);
-		match in_pitch {
-			Some(pitch) => {
-				// lay samples in, at this pitch:
-				println!("frequency: {}", pitch.frequency);
-				self.wave_maker.set_frequency(pitch.frequency);
-				for i in 0..SAMPLES_PER_FFT {
-					self.buffer[self.out_end + i] = self.wave_maker.next();
+		for i in 0 .. SAMPLES_PER_FFT {
+			self.bogus[i] = Complex::new(self.buffer[self.out_end + i], 0f32);
+		}
+		self.fft.process(&mut self.bogus);
+		let mut candidates = [0usize; TRIAL_BINS]; // lowest spot holds index (into bogus) to highest-valued peak; higher spots hold (alleged/probable) harmonics/octaves / less powerful spikes
+		for i in 0 .. SAMPLES_PER_FFT {
+			for j in 0 .. candidates.len() {
+				if self.bogus[i].re > self.bogus[candidates[j]].re {
+					for k in (j + 1 .. candidates.len()).rev() {
+						candidates[k] = candidates[k - 1]
+					}
+					candidates[j] = i;
 				}
-			}
-			None => {
-				// just fill self.buffer with that many zeros (silence):
-				self.buffer[self.out_end .. self.out_end + SAMPLES_PER_FFT].copy_from_slice(&ZERO_BUF[ .. SAMPLES_PER_FFT]);
+				break;
 			}
 		}
-		*/
-		
+		//println!("candidate[0]: {}  candidate[1]: {}  candidate[2]: {}", candidates[0], candidates[1], candidates[2]);
+		let mut frequencies = [0f32; TRIAL_BINS];
+		for i in 0 .. TRIAL_BINS {
+			frequencies[i] = candidates[i] as f32 * self.samples_per_second / (SAMPLES_PER_FFT as f32);
+		}
+		//println!("frequencies[0]: {}  frequencies[1]: {}  frequencies[2]: {}", frequencies[0], frequencies[1], frequencies[2]);
+		let target_frequency = self.song.match_current_note(frequencies);
+		if target_frequency > 0.0 {
+			println!("target_frequency: {}", target_frequency);
+		}
+
+		//println!("frequency: {}", frequency);
+		self.wave_maker.set_frequency(target_frequency);
+		for i in 0 .. SAMPLES_PER_FFT { // TODO!!!
+			self.buffer[self.out_end + i] = self.wave_maker.next();
+		}
+
 		// move up self.out_end:
 		self.out_end = self.out_end + SAMPLES_PER_FFT;
 	}
@@ -215,13 +295,46 @@ fn main() -> Result<()> {
 	let samples_per_second = out_config.sample_rate.0 as f32;
 	// out_config.channels unused?!
 
+	// Demo song (c scale):
+	let mut c_scale = Song::new(samples_per_second, vec![
+		/*Note::new(36, 1000),
+		Note::new(38, 1000),
+		Note::new(40, 1000),
+		Note::new(41, 1000),
+		Note::new(43, 1000),
+		Note::new(45, 1000),
+		Note::new(47, 1000),
+		Note::new(48, 1000),
+		Note::new(50, 1000),
+		Note::new(52, 1000),
+		Note::new(53, 1000),
+		Note::new(55, 1000),
+		Note::new(57, 1000),
+		Note::new(59, 1000),
+		Note::new(60, 1000),
+		Note::new(62, 1000),*/
+		Note::new(64, 1000),
+		/*Note::new(65, 1000),
+		Note::new(67, 1000),
+		Note::new(69, 1000),
+		Note::new(71, 1000),
+		Note::new(72, 1000),
+		Note::new(74, 1000),
+		Note::new(76, 1000),
+		Note::new(77, 1000),
+		Note::new(79, 1000),
+		Note::new(81, 1000),
+		Note::new(83, 1000),
+		Note::new(84, 1000),*/
+	]);
+
 	// FFT / pitch-detector:
-	let detector = McLeodDetector::<f32>::new(SAMPLES_PER_FFT, SAMPLES_PER_FFT/2);
+	let fft = Radix4::new(SAMPLES_PER_FFT, FftDirection::Forward);
 	// Wave maker (for output):
 	let wave_maker = WaveMaker::new(samples_per_second);
 
 	// our main buffer:
-	let input_buffer: Processor = Processor { buffer: [0.0; BUFFER_SIZE], in_end: 0,  out_start: 0, out_end: 0, samples_per_second: samples_per_second, detector: detector, wave_maker, };	// we create on the stack, rather than using Processor::new()
+	let input_buffer: Processor = Processor { song: c_scale, bogus: [Complex::new(0f32, 0f32); SAMPLES_PER_FFT], buffer: [0.0; BUFFER_SIZE], in_end: 0,  out_start: 0, out_end: 0, samples_per_second: samples_per_second, fft: fft, wave_maker, };	// we create on the stack, rather than using Processor::new()
 	let input_buffer_arc = Arc::new(Mutex::new(input_buffer));
 
 	// Set up output and error functions:
@@ -246,7 +359,7 @@ fn main() -> Result<()> {
 	in_stream.play()?;
 
 	// TEST: just "play" for ... seconds:
-	std::thread::sleep(std::time::Duration::from_millis(8000));
+	std::thread::sleep(std::time::Duration::from_millis(4000));
 	drop(in_stream);
 	drop(out_stream);
 	//TODO: let rb = RingBuffer::<i32>::new(2);
